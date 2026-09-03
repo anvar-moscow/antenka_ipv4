@@ -1,0 +1,140 @@
+#!/bin/bash
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Начинаем установку SOCKS5-прокси (Dante)...${NC}"
+
+# Установка пакетов
+apt update && apt install -y dante-server apache2-utils qrencode
+
+# Определяем интерфейс (пробуем IPv4, если нет - IPv6)
+INTERFACE=$(ip -4 route get 8.8.8.8 2>/dev/null | awk -- '{print $5}' | head -n 1)
+if [ -z "$INTERFACE" ]; then
+    INTERFACE=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk -- '{print $5}' | head -n 1)
+fi
+if [ -z "$INTERFACE" ]; then
+    INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n 1)
+fi
+echo -e "${GREEN}Используемый сетевой интерфейс: $INTERFACE${NC}"
+
+# Функция для генерации случайного свободного порта
+generate_random_port() {
+    while :; do
+        port=$((RANDOM % 64512 + 1024))
+        if ! ss -tulnp | awk '{print $4}' | grep -q ":$port"; then
+            echo $port
+            return
+        fi
+    done
+}
+
+# Запрос логина/пароля
+read -p "Хотите ввести логин и пароль вручную? (y/n): " choice
+if [[ "$choice" == "y" || "$choice" == "Y" ]]; then
+    read -p "Введите имя пользователя: " username
+    read -s -p "Введите пароль: " password
+    echo
+else
+    username=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 8)
+    password=$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 12)
+    echo -e "${GREEN}Сгенерированы логин и пароль:${NC}"
+    echo "Логин: $username"
+    echo "Пароль: $password"
+fi
+
+# Запрос порта
+read -p "Хотите ввести порт вручную? (y/n): " port_choice
+if [[ "$port_choice" == "y" || "$port_choice" == "Y" ]]; then
+    while :; do
+        read -p "Введите порт (1024-65535, не занятый системой): " port
+        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] && ! ss -tulnp | awk '{print $4}' | grep -q ":$port"; then
+            break
+        else
+            echo -e "${RED}Этот порт недоступен или некорректный. Попробуйте снова.${NC}"
+        fi
+    done
+else
+    port=$(generate_random_port)
+    echo -e "${GREEN}Сгенерирован случайный порт: $port${NC}"
+fi
+
+# Создаём системного пользователя
+useradd -r -s /bin/false $username 2>/dev/null
+(echo "$password"; echo "$password") | passwd $username
+
+# Конфигурация danted
+cat > /etc/danted.conf <<EOL
+logoutput: stderr
+internal: 0.0.0.0 port = $port
+external: $INTERFACE
+socksmethod: username
+user.privileged: root
+user.notprivileged: nobody
+
+client pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        log: error
+}
+
+socks pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        method: username
+        protocol: tcp udp
+        log: error
+}
+EOL
+
+# Открываем порт в брандмауэре (если установлен ufw)
+if command -v ufw &> /dev/null; then
+    ufw allow $port/tcp
+    echo -e "${GREEN}Порт $port открыт в ufw.${NC}"
+else
+    echo -e "${YELLOW}ufw не установлен, пропускаем открытие порта.${NC}"
+fi
+
+# Перезапуск и автозагрузка
+systemctl restart danted
+systemctl enable danted
+
+# ---- ОПРЕДЕЛЕНИЕ ВНЕШНЕГО IP (ТОЛЬКО IPv4) ----
+echo -e "${GREEN}Определяем внешний IPv4-адрес...${NC}"
+ip=$(curl -4 -s ifconfig.me 2>/dev/null)
+if [ -z "$ip" ]; then
+    ip=$(curl -4 -s icanhazip.com 2>/dev/null)
+fi
+if [ -z "$ip" ]; then
+    echo -e "${YELLOW}Не удалось получить IPv4-адрес автоматически. Сервер, возможно, не имеет IPv4.${NC}"
+    read -p "Введите внешний IP-адрес вручную (или оставьте пустым для автоопределения IPv6): " manual_ip
+    if [ -n "$manual_ip" ]; then
+        ip="$manual_ip"
+    else
+        # Пробуем получить IPv6
+        ip=$(curl -6 -s ifconfig.me 2>/dev/null)
+        if [ -z "$ip" ]; then
+            ip=$(curl -6 -s icanhazip.com 2>/dev/null)
+        fi
+        if [ -n "$ip" ]; then
+            echo -e "${YELLOW}Будет использован IPv6-адрес: $ip${NC}"
+        else
+            echo -e "${RED}Не удалось определить IP-адрес. Укажите его вручную в выводе ниже.${NC}"
+            ip="НЕ_ОПРЕДЕЛЁН"
+        fi
+    fi
+fi
+# ------------------------------------------------------------------
+
+# Вывод результатов
+echo "============================================================="
+echo -e "${GREEN}SOCKS5-прокси установлен. Подключение:${NC}"
+echo "IP: $ip"
+echo "Порт: $port"
+echo "Логин: $username"
+echo "Пароль: $password"
+echo "============================================================="
+echo -e "${GREEN}Готовая строка для антидетект браузеров:${NC}"
+echo "$ip:$port:$username:$password"
+echo "============================================================="
